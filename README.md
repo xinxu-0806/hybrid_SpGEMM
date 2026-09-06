@@ -52,6 +52,54 @@ algorithm or Host-visible behavior.
 | `tools/place_tapa_local_merge_balanced_slr_20260828.tcl`, `tools/capture_adaptive_hbm_postplace_diagnostics_20260828.tcl` | SLR constraints and the post-place congestion/timing gate. |
 | `tools/run_unified_real_hbm_paper10_board_20260904.sh` | Frozen ten-matrix, ten-repetition board measurement after timing closes. |
 
+### Design mind map
+
+```mermaid
+mindmap
+  root((Hybrid SpGEMM\nunified-real-HBM))
+    Host CPU/XRT
+      Matrix loader
+      Lightweight row profiler
+      Selector
+        MERGE-only
+        DENSE-only
+        Adaptive per-row route
+      Fragment command builder
+      Eight-shard B packer
+      One kernel launch
+      FP32 validation and timing
+    FPGA unified kernel
+      Command and scheduler fabric
+        Logical-row identity
+        Fragment list consumed internally
+        No Host round trip between rows
+      Eight HBM B shards
+        Reader
+        Scaling
+        Shard-local merge
+      MERGE path
+        8-way allocator
+        Forward tree
+        Keyed carry
+      DENSE path
+        Segmented reduction
+        Banked dual contexts
+        Extract and writeback
+      Shared output
+        Four-port CSR writer
+        Completion and statistics
+    Physical implementation
+      U280 HBM mapping
+      140 MHz target
+      3/1/4 SLR placement
+      Post-place congestion gate
+      Routed timing gate
+    Verification
+      Two CSim tests
+      XO export
+      Frozen paper-10 board suite
+```
+
 ## Reproduction order
 
 1. Install TAPA, Vitis/Vivado 2022.2, XRT, and the U280 2022.1 platform.
