@@ -100,6 +100,70 @@ mindmap
       Frozen paper-10 board suite
 ```
 
+### Host–FPGA architecture
+
+```mermaid
+flowchart LR
+  subgraph HOST[Host CPU / XRT]
+    A[Read A and B\nMatrixMarket]
+    P[Row profiler\nproducts / span / runs]
+    S{Host-visible mode}
+    MO[MERGE-only]
+    DO[DENSE-only]
+    AD[Adaptive\nper-row MERGE or DENSE]
+    C[Build fragment commands\nroute, logical-row ID, geometry]
+    PK[Pack B into 8 HBM shards]
+    XRT[Allocate BOs and launch\none unified kernel]
+    COL[Collect 4 output ports\nreassemble / validate FP32\nreport kernel time]
+  end
+
+  A --> P --> S
+  S --> MO --> C
+  S --> DO --> C
+  S --> AD --> C
+  A --> PK
+  C --> XRT
+  PK --> XRT
+
+  subgraph FPGA[U280 FPGA : one unified TAPA kernel]
+    CMD[Command reader + allocator\nall fragments consumed internally]
+    subgraph HBM[HBM B-side frontend]
+      R0[Shard 0]
+      R1[Shard 1]
+      R2[Shard 2]
+      R3[Shard 3]
+      R4[Shard 4]
+      R5[Shard 5]
+      R6[Shard 6]
+      R7[Shard 7]
+    end
+    LOC[8 shard-local merge stages]
+    RT{Row route}
+    subgraph MP[MERGE path]
+      MT[Allocator / forward tree\nkeyed carry]
+    end
+    subgraph DP[DENSE path]
+      SEG[8-wide segmented reduction]
+      ACC[Banked dual-context\naccumulator]
+      EXT[Extract / writeback]
+    end
+    OUT[Shared four-port CSR writer\ncompletion + statistics]
+  end
+
+  XRT --> CMD
+  XRT --> R0 & R1 & R2 & R3 & R4 & R5 & R6 & R7
+  R0 & R1 & R2 & R3 & R4 & R5 & R6 & R7 --> LOC --> RT
+  CMD --> RT
+  RT -->|MERGE| MT --> OUT
+  RT -->|DENSE| SEG --> ACC --> EXT --> OUT
+  OUT --> COL
+
+  classDef host fill:#e8f1ff,stroke:#3568a8,color:#111;
+  classDef fpga fill:#edfff2,stroke:#3b8a57,color:#111;
+  class A,P,S,MO,DO,AD,C,PK,XRT,COL host;
+  class CMD,R0,R1,R2,R3,R4,R5,R6,R7,LOC,RT,MT,SEG,ACC,EXT,OUT fpga;
+```
+
 ## Reproduction order
 
 1. Install TAPA, Vitis/Vivado 2022.2, XRT, and the U280 2022.1 platform.
