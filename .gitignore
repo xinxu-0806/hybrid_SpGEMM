@@ -1,0 +1,25 @@
+# Generated FPGA implementation products and local tool state
+build/
+u280/
+checkpoints/
+.Xil/
+.ipcache/
+.local/
+work.out/
+*.xclbin
+*.xo
+*.dcp
+*.rpt
+*.log
+*.jou
+*.pb
+**/__pycache__/
+*.pyc
+*.mtx
+*.pdf
+*.bin
+data/
+logs/
+projects/
+cosim_work/
+tools/tapa_local/
