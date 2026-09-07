@@ -606,6 +606,66 @@ void unified_allocator_source_crossbar8(
 	leaf4.write(end); leaf5.write(end); leaf6.write(end); leaf7.write(end);
 }
 
+// A physically independent 2x2 butterfly switch.  The top-level instantiates
+// four of these per routing stage, so a 133-bit stream only needs to meet its
+// paired peer locally instead of pulling all eight HBM producers into one
+// placement island.
+void unified_allocator_crossbar_switch2(
+		tapa::istream<UnifiedRoutedLeafToken>& input0,
+		tapa::istream<UnifiedRoutedLeafToken>& input1,
+		ap_uint<2> route_bit,
+		tapa::ostream<UnifiedRoutedLeafToken>& output_low,
+		tapa::ostream<UnifiedRoutedLeafToken>& output_high) {
+	UnifiedRoutedLeafToken held0 = 0;
+	UnifiedRoutedLeafToken held1 = 0;
+	bool valid0 = false;
+	bool valid1 = false;
+	bool ended0 = false;
+	bool ended1 = false;
+	bool turn = false;
+	while (!(ended0 && ended1 && !valid0 && !valid1)) {
+#pragma HLS PIPELINE II=1
+		if (!ended0 && !valid0) {
+			UnifiedRoutedLeafToken token;
+			if (input0.try_read(token)) {
+				if (token[132]) ended0 = true;
+				else { held0 = token; valid0 = true; }
+			}
+		}
+		if (!ended1 && !valid1) {
+			UnifiedRoutedLeafToken token;
+			if (input1.try_read(token)) {
+				if (token[132]) ended1 = true;
+				else { held1 = token; valid1 = true; }
+			}
+		}
+		const ap_uint<3> dest0 = held0.range(131, 129);
+		const ap_uint<3> dest1 = held1.range(131, 129);
+		const bool low0 = valid0 && !dest0[route_bit];
+		const bool low1 = valid1 && !dest1[route_bit];
+		const bool high0 = valid0 && dest0[route_bit];
+		const bool high1 = valid1 && dest1[route_bit];
+		bool emitted0 = false;
+		bool emitted1 = false;
+		const bool select0_low = low0 && (!low1 || !turn);
+		const bool select0_high = high0 && (!high1 || !turn);
+		if ((low0 || low1) && output_low.try_write(select0_low ? held0 : held1)) {
+			if (select0_low) emitted0 = true; else emitted1 = true;
+			if (low0 && low1) turn = !turn;
+		}
+		if ((high0 || high1) && output_high.try_write(select0_high ? held0 : held1)) {
+			if (select0_high) emitted0 = true; else emitted1 = true;
+			if (high0 && high1) turn = !turn;
+		}
+		if (emitted0) valid0 = false;
+		if (emitted1) valid1 = false;
+	}
+	UnifiedRoutedLeafToken end = 0;
+	end[132] = 1;
+	output_low.write(end);
+	output_high.write(end);
+}
+
 // One stage of an 8x8 self-routing network.  Inputs are passed in four
 // adjacent pairs by the top-level wiring.  Each pair routes on one destination
 // bit and buffers a same-direction conflict for a later cycle.  Three such

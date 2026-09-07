@@ -553,27 +553,19 @@ void adaptive_hbm_unified_real_hbm_tapa(
 			heavy_vector_stage0[3], heavy_vector_stage1[1])
 		.invoke(unified_full_heavy_merge4, heavy_vector_stage1[0],
 			heavy_vector_stage1[1], heavy_vector_root)
-		.invoke(unified_allocator_crossbar_stage8,
-			routed_sources[0], routed_sources[4], routed_sources[1],
-			routed_sources[5], routed_sources[2], routed_sources[6],
-			routed_sources[3], routed_sources[7], 2,
-			crossbar_stage0[0], crossbar_stage0[4], crossbar_stage0[1],
-			crossbar_stage0[5], crossbar_stage0[2], crossbar_stage0[6],
-			crossbar_stage0[3], crossbar_stage0[7])
-		.invoke(unified_allocator_crossbar_stage8,
-			crossbar_stage0[0], crossbar_stage0[2], crossbar_stage0[1],
-			crossbar_stage0[3], crossbar_stage0[4], crossbar_stage0[6],
-			crossbar_stage0[5], crossbar_stage0[7], 1,
-			crossbar_stage1[0], crossbar_stage1[2], crossbar_stage1[1],
-			crossbar_stage1[3], crossbar_stage1[4], crossbar_stage1[6],
-			crossbar_stage1[5], crossbar_stage1[7])
-		.invoke(unified_allocator_crossbar_stage8,
-			crossbar_stage1[0], crossbar_stage1[1], crossbar_stage1[2],
-			crossbar_stage1[3], crossbar_stage1[4], crossbar_stage1[5],
-			crossbar_stage1[6], crossbar_stage1[7], 0,
-			crossbar_stage2[0], crossbar_stage2[1], crossbar_stage2[2],
-			crossbar_stage2[3], crossbar_stage2[4], crossbar_stage2[5],
-			crossbar_stage2[6], crossbar_stage2[7])
+		// The port order is exactly the prior 8-wide stage's four pairs.
+		.invoke(unified_allocator_crossbar_switch2, routed_sources[0], routed_sources[4], 2, crossbar_stage0[0], crossbar_stage0[4])
+		.invoke(unified_allocator_crossbar_switch2, routed_sources[1], routed_sources[5], 2, crossbar_stage0[1], crossbar_stage0[5])
+		.invoke(unified_allocator_crossbar_switch2, routed_sources[2], routed_sources[6], 2, crossbar_stage0[2], crossbar_stage0[6])
+		.invoke(unified_allocator_crossbar_switch2, routed_sources[3], routed_sources[7], 2, crossbar_stage0[3], crossbar_stage0[7])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage0[0], crossbar_stage0[2], 1, crossbar_stage1[0], crossbar_stage1[2])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage0[1], crossbar_stage0[3], 1, crossbar_stage1[1], crossbar_stage1[3])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage0[4], crossbar_stage0[6], 1, crossbar_stage1[4], crossbar_stage1[6])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage0[5], crossbar_stage0[7], 1, crossbar_stage1[5], crossbar_stage1[7])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage1[0], crossbar_stage1[1], 0, crossbar_stage2[0], crossbar_stage2[1])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage1[2], crossbar_stage1[3], 0, crossbar_stage2[2], crossbar_stage2[3])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage1[4], crossbar_stage1[5], 0, crossbar_stage2[4], crossbar_stage2[5])
+		.invoke(unified_allocator_crossbar_switch2, crossbar_stage1[6], crossbar_stage1[7], 0, crossbar_stage2[6], crossbar_stage2[7])
 		.invoke(unified_allocator_crossbar_finish8,
 			crossbar_stage2[0], crossbar_stage2[1], crossbar_stage2[2],
 			crossbar_stage2[3], crossbar_stage2[4], crossbar_stage2[5],
