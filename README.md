@@ -8,11 +8,11 @@ bitstreams.
 
 The Host exposes three modes: `merge-only`, `dense-only`, and `adaptive`.
 In adaptive mode it chooses MERGE or DENSE for each output row.  The FPGA
-remains a single unified kernel: eight HBM B-shards feed the shared allocator,
+remains a single unified kernel: eight HBM B-channels feed the shared allocator,
 the MERGE forward tree or DENSE dual-context accumulator, then the common
 four-port CSR writer.  No external DMSA kernel is a selectable path.
 
-The current v12 candidate retains all eight HBM shards and the full MERGE and
+The current v12 candidate retains all eight HBM channels and the full MERGE and
 DENSE paths.  Its only pending physical experiment is shallower elastic FIFO
 depths, intended to reduce CLB/SLL placement pressure without changing the
 algorithm or Host-visible behavior.
@@ -25,7 +25,7 @@ algorithm or Host-visible behavior.
 | --- | --- |
 | `src/host_adaptive_hbm_unified_real.cpp` | Host entry point for this kernel. |
 | `src/host_adaptive_hbm_spgemm_dim_commanded.cpp` | Builds the one-invocation fragment command list, retaining each complete logical-row identity. |
-| `src/host_adaptive_hbm_spgemm_scalable.cpp` | Matrix loading, selection, eight-shard B packing, XRT launch, result collection, FP32 checking, and kernel-time measurement. |
+| `src/host_adaptive_hbm_spgemm_scalable.cpp` | Matrix loading, selection, eight-channel B packing, XRT launch, result collection, FP32 checking, and kernel-time measurement. |
 | `src/adaptive_light_selector.h`, `src/adaptive_route_model.h`, `src/rowpersistent_selector_policy_robust_v3_generated.h` | Lightweight row-feature/cost-model policy for `MERGE`, `DENSE`, and adaptive row routes. |
 | `src/adaptive_hbm/adaptive_hbm_route_word.h`, `src/host_device_utils.h` | Host/kernel route ABI and XRT helpers. |
 
@@ -33,9 +33,9 @@ algorithm or Host-visible behavior.
 
 | File or directory | Responsibility |
 | --- | --- |
-| `src/adaptive_hbm_tapa/experimental/unified_real_hbm/adaptive_hbm_unified_real_hbm_tapa.cpp` | **Kernel Top**: consumes all commands in one launch, drives eight HBM B shards, routes each row into MERGE or DENSE, and connects the common output network. |
+| `src/adaptive_hbm_tapa/experimental/unified_real_hbm/adaptive_hbm_unified_real_hbm_tapa.cpp` | **Kernel Top**: consumes all commands in one launch, drives eight HBM B channels, routes each row into MERGE or DENSE, and connects the common output network. |
 | `src/adaptive_hbm_tapa/experimental/unified_real_hbm/*.h` | Top-level ABI. The two `*_tb.cpp` files are the current CSim tests. |
-| `src/adaptive_hbm_tapa/adaptive_hbm_tapa_scalable.{h,cpp}` and `adaptive_hbm_tapa_merge_fabric.hpp` | Production reader, B scaling, shard-local merge, and stream/token definitions. |
+| `src/adaptive_hbm_tapa/adaptive_hbm_tapa_scalable.{h,cpp}` and `adaptive_hbm_tapa_merge_fabric.hpp` | Production reader, B scaling, channel-local merge, and stream/token definitions. |
 | `experimental/merge_allocator8`, `merge_forward_tree8`, `merge15_packetmeta4` | MERGE path: row allocator, 8-way forward tree, and four-port packetized CSR output. |
 | `experimental/segmented8_shared`, `merge_keyed_carry8`, `unified_dense_dual_context` | DENSE path: pre-bank segmented reduction, cross-packet duplicate carry, banked dual-context accumulation, extraction, and writeback. |
 | `experimental/unified_adaptive_datapath`, `unified_allocator_merge_output`, `unified_adaptive_full_output` | Integration layers that assemble the two paths into one routed, ordered-output graph. |
@@ -52,54 +52,6 @@ algorithm or Host-visible behavior.
 | `tools/place_tapa_local_merge_balanced_slr_20260828.tcl`, `tools/capture_adaptive_hbm_postplace_diagnostics_20260828.tcl` | SLR constraints and the post-place congestion/timing gate. |
 | `tools/run_unified_real_hbm_paper10_board_20260904.sh` | Frozen ten-matrix, ten-repetition board measurement after timing closes. |
 
-### Design mind map
-
-```mermaid
-mindmap
-  root((Hybrid SpGEMM\nunified-real-HBM))
-    Host CPU/XRT
-      Matrix loader
-      Lightweight row profiler
-      Selector
-        MERGE-only
-        DENSE-only
-        Adaptive per-row route
-      Fragment command builder
-      Eight-shard B packer
-      One kernel launch
-      FP32 validation and timing
-    FPGA unified kernel
-      Command and scheduler fabric
-        Logical-row identity
-        Fragment list consumed internally
-        No Host round trip between rows
-      Eight HBM B shards
-        Reader
-        Scaling
-        Shard-local merge
-      MERGE path
-        8-way allocator
-        Forward tree
-        Keyed carry
-      DENSE path
-        Segmented reduction
-        Banked dual contexts
-        Extract and writeback
-      Shared output
-        Four-port CSR writer
-        Completion and statistics
-    Physical implementation
-      U280 HBM mapping
-      140 MHz target
-      3/1/4 SLR placement
-      Post-place congestion gate
-      Routed timing gate
-    Verification
-      Two CSim tests
-      XO export
-      Frozen paper-10 board suite
-```
-
 ### Host–FPGA architecture
 
 ```mermaid
@@ -112,7 +64,7 @@ flowchart LR
     DO[DENSE-only]
     AD[Adaptive\nper-row MERGE or DENSE]
     C[Build fragment commands\nroute, logical-row ID, geometry]
-    PK[Pack B into 8 HBM shards]
+    PK[Pack B into 8 HBM channels]
     XRT[Allocate BOs and launch\none unified kernel]
     COL[Collect 4 output ports\nreassemble / validate FP32\nreport kernel time]
   end
@@ -127,17 +79,17 @@ flowchart LR
 
   subgraph FPGA[U280 FPGA : one unified TAPA kernel]
     CMD[Command reader + allocator\nall fragments consumed internally]
-    subgraph HBM[HBM B-side frontend]
-      R0[Shard 0]
-      R1[Shard 1]
-      R2[Shard 2]
-      R3[Shard 3]
-      R4[Shard 4]
-      R5[Shard 5]
-      R6[Shard 6]
-      R7[Shard 7]
+    subgraph HBM[8 HBM B channels]
+      R0[Channel 0]
+      R1[Channel 1]
+      R2[Channel 2]
+      R3[Channel 3]
+      R4[Channel 4]
+      R5[Channel 5]
+      R6[Channel 6]
+      R7[Channel 7]
     end
-    LOC[8 shard-local merge stages]
+    LOC[8 channel-local merge stages]
     RT{Row route}
     subgraph MP[MERGE path]
       MT[Allocator / forward tree\nkeyed carry]
