@@ -16,6 +16,7 @@ constexpr uint32_t kRealRouteMerge = 2;
 constexpr uint32_t kRealRouteDense = 3;
 constexpr uint32_t kRealMergeRecordRoute = 1;
 constexpr uint32_t kRealDenseRecordRoute = 3;
+constexpr id_t kCompletionTraceDisabled = 2;
 
 enum class RealMode { kAdaptive, kMergePreferred, kDenseOnly };
 
@@ -95,6 +96,66 @@ static void real_append_task(RealFragmentBatch* output, uint64_t low,
 	output->tasks[word].lane[lane] = low;
 	output->tasks[word].lane[lane + 1U] = high;
 	++output->task_count;
+}
+
+// Build the command tail consumed independently by each B-HBM reader.
+// Every tail starts with ceil(fragment_count/16) count-header beats; lane f%16
+// stores the number of descriptors for fragment f on this shard.  The
+// remaining beats contain four 128-bit descriptors each, concatenated in
+// fragment order.  The numerical B offsets inside descriptors remain
+// unchanged because the tail is appended after the original B data.
+static std::array<std::vector<Beat512>, kShards>
+real_build_embedded_shard_commands(const RealFragmentBatch& batch) {
+	const size_t fragments = batch.logical_row.size();
+	const size_t header_words = (fragments + 15) / 16;
+	std::array<std::vector<Beat512>, kShards> result;
+	std::array<uint64_t, kShards> descriptor_counts{};
+	for (unsigned shard = 0; shard < kShards; ++shard)
+		result[shard].resize(header_words);
+
+	for (size_t fragment = 0; fragment < fragments; ++fragment) {
+		std::array<uint32_t, kShards> counts{};
+		for (id_t task = batch.row_task_ptr[fragment];
+				task < batch.row_task_ptr[fragment + 1]; ++task) {
+			const unsigned shard = (real_task_low(batch.tasks, task) >> 56) & 7U;
+			if (counts[shard] == std::numeric_limits<uint32_t>::max())
+				throw std::runtime_error("one fragment/shard command count overflows");
+			++counts[shard];
+		}
+		for (unsigned shard = 0; shard < kShards; ++shard) {
+			const unsigned slot = fragment & 15U;
+			const unsigned lane = slot >> 1;
+			const unsigned shift = (slot & 1U) * 32U;
+			result[shard][fragment >> 4].lane[lane]
+				|= uint64_t(counts[shard]) << shift;
+			descriptor_counts[shard] += counts[shard];
+			if (descriptor_counts[shard]
+					> std::numeric_limits<uint32_t>::max())
+				throw std::runtime_error("shard command cursor exceeds 32 bits");
+		}
+	}
+
+	for (unsigned shard = 0; shard < kShards; ++shard)
+		result[shard].resize(header_words
+			+ (descriptor_counts[shard] + 3) / 4);
+	std::array<uint64_t, kShards> cursors{};
+	for (size_t fragment = 0; fragment < fragments; ++fragment) {
+		for (id_t task = batch.row_task_ptr[fragment];
+				task < batch.row_task_ptr[fragment + 1]; ++task) {
+			const uint64_t low = real_task_low(batch.tasks, task);
+			const uint64_t high = real_task_high(batch.tasks, task);
+			const unsigned shard = (low >> 56) & 7U;
+			const uint64_t cursor = cursors[shard]++;
+			Beat512& word = result[shard][header_words + (cursor >> 2)];
+			const unsigned lane = (cursor & 3U) * 2U;
+			word.lane[lane] = low;
+			word.lane[lane + 1U] = high;
+		}
+	}
+	for (unsigned shard = 0; shard < kShards; ++shard)
+		if (cursors[shard] != descriptor_counts[shard])
+			throw std::runtime_error("embedded shard command count mismatch");
+	return result;
 }
 
 static RealFragmentBatch real_expand_rpc1(DimSuperbatch* source) {
@@ -189,6 +250,175 @@ static RealFragmentBatch real_slice(const RealFragmentBatch& source,
 	return output;
 }
 
+// Read-only packing diagnostic used to explain a deterministic board hang at
+// one physical-fragment boundary.  It is deliberately Host-only and guarded
+// by an environment variable, so it cannot alter the kernel ABI or production
+// scheduling.  Applying it after ADAPT_DEBUG_MAX_FRAGMENTS makes the final
+// records in a passing/failing prefix directly comparable.
+static void real_debug_dump_fragment_tail(const RealFragmentBatch& batch) {
+	const char* text = std::getenv("ADAPT_DEBUG_DUMP_FRAGMENT_TAIL");
+	if (text == nullptr) return;
+	const unsigned long requested = std::stoul(text);
+	if (requested == 0)
+		throw std::runtime_error(
+			"ADAPT_DEBUG_DUMP_FRAGMENT_TAIL must be positive");
+	const size_t begin = batch.logical_row.size() > requested
+		? batch.logical_row.size() - requested : 0;
+	for (size_t fragment = begin; fragment < batch.logical_row.size(); ++fragment) {
+		const id_t task_begin = batch.row_task_ptr[fragment];
+		const id_t task_end = batch.row_task_ptr[fragment + 1];
+		std::array<uint64_t, kShards> shard_items{};
+		std::array<uint32_t, kShards> shard_tasks{};
+		uint64_t max_items = 0;
+		for (id_t task = task_begin; task < task_end; ++task) {
+			const uint64_t low = real_task_low(batch.tasks, task);
+			const unsigned shard = (low >> 56) & 7U;
+			const uint64_t items = (low >> 32) & 0xffffffU;
+			shard_items[shard] += items;
+			++shard_tasks[shard];
+			max_items = std::max(max_items, items);
+		}
+		std::cout << "FRAGMENT_DEBUG index=" << fragment
+			<< " logical_row=" << batch.logical_row[fragment]
+			<< " same_prev=" << (fragment != 0
+				&& batch.logical_row[fragment - 1] == batch.logical_row[fragment])
+			<< " same_next=" << (fragment + 1 < batch.logical_row.size()
+				&& batch.logical_row[fragment + 1] == batch.logical_row[fragment])
+			<< " route=" << (batch.base_route[fragment] & kRouteModeMask)
+			<< " capacity_lock="
+			<< ((batch.base_route[fragment] & kScalableCapacityLock) != 0)
+			<< " products=" << real_fragment_products(batch.base_route[fragment])
+			<< " dense_base="
+			<< static_cast<uint32_t>(batch.geometry[fragment])
+			<< " span=" << (batch.geometry[fragment] >> 32)
+			<< " source_mask=" << batch.source_mask[fragment]
+			<< " tasks=" << (task_end - task_begin)
+			<< " max_task_items=" << max_items;
+		for (unsigned shard = 0; shard < kShards; ++shard)
+			if (shard_tasks[shard] != 0)
+				std::cout << " s" << shard << "=("
+					<< shard_tasks[shard] << ',' << shard_items[shard] << ')';
+		std::cout << '\n';
+		if (std::getenv("ADAPT_DEBUG_DUMP_FRAGMENT_TASKS") != nullptr) {
+			for (id_t task = task_begin; task < task_end; ++task) {
+				const uint64_t low = real_task_low(batch.tasks, task);
+				const uint64_t high = real_task_high(batch.tasks, task);
+				std::cout << "FRAGMENT_TASK fragment=" << fragment
+					<< " local_task=" << (task - task_begin)
+					<< " shard=" << ((low >> 56) & 7U)
+					<< " offset=" << static_cast<uint32_t>(low)
+					<< " items=" << ((low >> 32) & 0xffffffU)
+					<< " packed_route=" << ((low >> 59) & 7U)
+					<< " row_last=" << ((low >> 63) & 1U)
+					<< " high=" << high << '\n';
+			}
+		}
+	}
+}
+
+// Diagnostic-only command filter.  It is used on an already isolated row to
+// determine whether one shard's Nth B-row command triggers a protocol hang.
+// Numerical verification is expected to fail after a truncated experiment;
+// the useful observation is whether both kernel launches return.  Production
+// runs explicitly clear this environment variable.
+static void real_debug_limit_tasks_per_shard(RealFragmentBatch* batch) {
+	const char* limit_text = std::getenv("ADAPT_DEBUG_MAX_TASKS_PER_SHARD");
+	const char* drop_text = std::getenv("ADAPT_DEBUG_DROP_FRAGMENT_TASK");
+	if (limit_text == nullptr && drop_text == nullptr) return;
+	const unsigned long limit = limit_text == nullptr
+		? std::numeric_limits<unsigned long>::max() : std::stoul(limit_text);
+	if (limit == 0)
+		throw std::runtime_error(
+			"ADAPT_DEBUG_MAX_TASKS_PER_SHARD must be positive");
+	size_t drop_fragment = std::numeric_limits<size_t>::max();
+	unsigned long drop_task = std::numeric_limits<unsigned long>::max();
+	if (drop_text != nullptr) {
+		const std::string drop(drop_text);
+		const size_t separator = drop.find(':');
+		if (separator == std::string::npos)
+			throw std::runtime_error(
+				"ADAPT_DEBUG_DROP_FRAGMENT_TASK must be fragment:local_task");
+		drop_fragment = std::stoul(drop.substr(0, separator));
+		drop_task = std::stoul(drop.substr(separator + 1));
+	}
+	RealFragmentBatch filtered;
+	filtered.B = batch->B;
+	filtered.row_task_ptr.push_back(0);
+	for (size_t fragment = 0; fragment < batch->logical_row.size(); ++fragment) {
+		std::array<unsigned long, kShards> kept{};
+		uint32_t source_mask = 0;
+		for (id_t task = batch->row_task_ptr[fragment];
+				task < batch->row_task_ptr[fragment + 1]; ++task) {
+			const unsigned long local_task
+				= task - batch->row_task_ptr[fragment];
+			if (fragment == drop_fragment && local_task == drop_task) continue;
+			const uint64_t low = real_task_low(batch->tasks, task);
+			const unsigned shard = (low >> 56) & 7U;
+			if (kept[shard] >= limit) continue;
+			++kept[shard];
+			source_mask |= uint32_t{1} << shard;
+			real_append_task(&filtered, low, real_task_high(batch->tasks, task));
+		}
+		filtered.row_task_ptr.push_back(filtered.task_count);
+		filtered.base_route.push_back(batch->base_route[fragment]);
+		filtered.source_mask.push_back(source_mask);
+		filtered.geometry.push_back(batch->geometry[fragment]);
+		filtered.logical_row.push_back(batch->logical_row[fragment]);
+	}
+	if (filtered.tasks.empty()) filtered.tasks.resize(1);
+	filtered.products = batch->products;
+	filtered.packet_words_upper = batch->packet_words_upper;
+	filtered.metadata_records_upper = batch->metadata_records_upper;
+	filtered.packing_ms = batch->packing_ms;
+	*batch = std::move(filtered);
+	if (limit_text != nullptr)
+		std::cout << "[HOST] debug max tasks per shard=" << limit << std::endl;
+	if (drop_text != nullptr)
+		std::cout << "[HOST] debug dropped fragment task=" << drop_text
+			<< std::endl;
+}
+
+// Diagnostic probe for dispatcher head-of-line blocking.  Preserve each
+// shard's command order, but interleave the eight shard-local queues one task
+// per round.  MERGE sees the same sorted runs in the same per-shard order and
+// DENSE is order-independent, so this transformation is numerically neutral.
+// Once confirmed on hardware, the same ordering becomes part of production
+// packing together with early per-shard boundaries.
+static void real_debug_round_robin_tasks(RealFragmentBatch* batch) {
+	if (std::getenv("ADAPT_DEBUG_ROUND_ROBIN_TASKS") == nullptr) return;
+	RealFragmentBatch reordered;
+	reordered.B = batch->B;
+	reordered.row_task_ptr.push_back(0);
+	for (size_t fragment = 0; fragment < batch->logical_row.size(); ++fragment) {
+		std::array<std::vector<std::pair<uint64_t, uint64_t> >, kShards> queues;
+		size_t rounds = 0;
+		for (id_t task = batch->row_task_ptr[fragment];
+				task < batch->row_task_ptr[fragment + 1]; ++task) {
+			const uint64_t low = real_task_low(batch->tasks, task);
+			const unsigned shard = (low >> 56) & 7U;
+			queues[shard].push_back({low, real_task_high(batch->tasks, task)});
+			rounds = std::max(rounds, queues[shard].size());
+		}
+		for (size_t round = 0; round < rounds; ++round)
+			for (unsigned shard = 0; shard < kShards; ++shard)
+				if (round < queues[shard].size())
+					real_append_task(&reordered, queues[shard][round].first,
+						queues[shard][round].second);
+		reordered.row_task_ptr.push_back(reordered.task_count);
+		reordered.base_route.push_back(batch->base_route[fragment]);
+		reordered.source_mask.push_back(batch->source_mask[fragment]);
+		reordered.geometry.push_back(batch->geometry[fragment]);
+		reordered.logical_row.push_back(batch->logical_row[fragment]);
+	}
+	if (reordered.tasks.empty()) reordered.tasks.resize(1);
+	reordered.products = batch->products;
+	reordered.packet_words_upper = batch->packet_words_upper;
+	reordered.metadata_records_upper = batch->metadata_records_upper;
+	reordered.packing_ms = batch->packing_ms;
+	*batch = std::move(reordered);
+	std::cout << "[HOST] debug round-robin shard tasks=1" << std::endl;
+}
+
 static std::vector<RealFragmentBatch> real_capacity_slices(
 		const RealFragmentBatch& source) {
 	const uint64_t max_words = kRealTargetBankBytes / sizeof(Beat512);
@@ -234,6 +464,68 @@ static std::vector<RealMode> real_requested_modes() {
 	if (mode == "dense" || mode == "dense_only")
 		return {RealMode::kDenseOnly};
 	throw std::runtime_error("invalid ADAPT_SCALABLE_MODE: " + mode);
+}
+
+// Offline admission audit for the frozen paper set.  It deliberately uses the
+// exact packed batch that would be sent to XRT, but it has no effect on the
+// production launch path.  Aggregate capacities alone can hide one hot HBM
+// shard or one pathological fragment, so report both maxima explicitly.
+static void real_print_dry_run_diagnostics(const RealFragmentBatch& batch,
+		unsigned batch_index) {
+	const auto embedded_commands = real_build_embedded_shard_commands(batch);
+	uint64_t b_total_words = 0, b_max_words = 0;
+	uint64_t command_total_words = 0, command_max_words = 0;
+	uint64_t combined_max_words = 0;
+	for (unsigned shard = 0; shard < kShards; ++shard) {
+		b_total_words += batch.B->at(shard).size();
+		b_max_words = std::max<uint64_t>(
+			b_max_words, batch.B->at(shard).size());
+		command_total_words += embedded_commands[shard].size();
+		command_max_words = std::max<uint64_t>(
+			command_max_words, embedded_commands[shard].size());
+		combined_max_words = std::max<uint64_t>(combined_max_words,
+			batch.B->at(shard).size() + embedded_commands[shard].size());
+	}
+	if (combined_max_words * sizeof(Beat512) > kRealTargetBankBytes)
+		throw std::runtime_error(
+			"dry-run B data plus embedded commands exceeds one HBM bank");
+	uint64_t max_products = 0, max_words = 0;
+	id_t max_tasks = 0;
+	id_t max_tasks_one_shard = 0;
+	uint64_t wide_dense = 0, merge_fragments = 0, dense_fragments = 0;
+	for (size_t fragment = 0; fragment < batch.logical_row.size(); ++fragment) {
+		std::array<id_t, kShards> shard_tasks{};
+		for (id_t task = batch.row_task_ptr[fragment];
+				task < batch.row_task_ptr[fragment + 1]; ++task) {
+			const unsigned shard = (real_task_low(batch.tasks, task) >> 56) & 7U;
+			max_tasks_one_shard = std::max(
+				max_tasks_one_shard, ++shard_tasks[shard]);
+		}
+		const uint32_t route = batch.base_route[fragment] & kRouteModeMask;
+		if (route == kRealRouteDense) {
+			++dense_fragments;
+			if ((batch.geometry[fragment] >> 32) > 32768) ++wide_dense;
+		} else {
+			++merge_fragments;
+		}
+		max_products = std::max<uint64_t>(max_products,
+			real_fragment_products(batch.base_route[fragment]));
+		max_words = std::max<uint64_t>(max_words,
+			real_fragment_word_upper(batch.base_route[fragment],
+				batch.geometry[fragment]));
+		max_tasks = std::max<id_t>(max_tasks,
+			batch.row_task_ptr[fragment + 1] - batch.row_task_ptr[fragment]);
+	}
+	std::cout << "real_batch_audit=" << batch_index
+		<< " B_words(total,max_shard)=(" << b_total_words << ',' << b_max_words
+		<< ") embedded_command_words(total,max_shard)=("
+		<< command_total_words << ',' << command_max_words
+		<< ") combined_max_shard_words=" << combined_max_words
+		<< " tasks=" << batch.task_count << " max_tasks=" << max_tasks
+		<< " max_tasks_one_shard=" << max_tasks_one_shard
+		<< " max_products=" << max_products << " max_output_words=" << max_words
+		<< " route_fragments(M,D)=(" << merge_fragments << ',' << dense_fragments
+		<< ") wide_dense=" << wide_dense << std::endl;
 }
 
 static std::vector<uint32_t> real_routes_for_mode(
@@ -418,15 +710,17 @@ static RealDecodedOutput real_decode_output(
 	for (const auto& entry : expected_eors)
 		if (output.eors[entry.first] != entry.second)
 			throw std::runtime_error("real unified EOR count mismatch");
-	std::map<id_t, uint64_t> got_completions;
-	for (id_t index = 0; index < completion_stats.at(0); ++index) {
-		const uint64_t event = completions[index];
-		if ((event >> 49) & 1U)
-			throw std::runtime_error("real unified wide completion mismatch");
-		++got_completions[(event >> 11) & 0xffffffffU];
+	if (completion_stats.at(1) != kCompletionTraceDisabled) {
+		std::map<id_t, uint64_t> got_completions;
+		for (id_t index = 0; index < completion_stats.at(0); ++index) {
+			const uint64_t event = completions[index];
+			if ((event >> 49) & 1U)
+				throw std::runtime_error("real unified wide completion mismatch");
+			++got_completions[(event >> 11) & 0xffffffffU];
+		}
+		if (got_completions != expected_completions)
+			throw std::runtime_error("real unified completion count mismatch");
 	}
-	if (got_completions != expected_completions)
-		throw std::runtime_error("real unified completion count mismatch");
 	return output;
 }
 
@@ -435,72 +729,90 @@ static void real_execute_batch(const Csr& matrix,
 		unsigned reps, unsigned batch_index, id_t heavy_threshold,
 		std::ofstream& csv, std::vector<RealModeTotal>* totals) {
 	const id_t fragments = batch.logical_row.size();
-	const id_t data_capacity = std::max<uint64_t>(1, batch.packet_words_upper);
+	id_t data_capacity = std::max<uint64_t>(1, batch.packet_words_upper);
+	if (const char* capacity_text = std::getenv("ADAPT_DEBUG_DATA_WORD_CAPACITY")) {
+		const unsigned long requested = std::stoul(capacity_text);
+		if (requested == 0)
+			throw std::runtime_error("ADAPT_DEBUG_DATA_WORD_CAPACITY must be positive");
+		data_capacity = requested;
+		std::cout << "[HOST] debug data-word capacity=" << data_capacity
+			<< std::endl;
+	}
 	const id_t meta_capacity = std::max<uint64_t>(1,
 		(batch.metadata_records_upper + 3) / 4);
 	const id_t completion_capacity = std::max<id_t>(1, fragments);
 	if (uint64_t(data_capacity) * sizeof(Beat512) > kRealTargetBankBytes)
 		throw std::runtime_error("real unified output slice exceeds one HBM bank");
+	// Board-side progress markers distinguish BO setup, HBM DMA and kernel wait
+	// when a long real workload stops after the small protocol gates pass.
+	std::cout << "[HOST] batch=" << batch_index << " prepare fragments="
+		<< fragments << " data_words=" << data_capacity << std::endl;
 
-	xrt::bo task_bo(device, batch.tasks.size() * sizeof(TaskWord512),
-		kernel.group_id(0));
-	xrt::bo rowptr_bo(device, batch.row_task_ptr.size() * sizeof(id_t),
-		kernel.group_id(1));
 	xrt::bo route_bo(device, batch.base_route.size() * sizeof(uint32_t),
-		kernel.group_id(2));
+		kernel.group_id(0));
 	xrt::bo mask_bo(device, batch.source_mask.size() * sizeof(uint32_t),
-		kernel.group_id(3));
+		kernel.group_id(1));
 	xrt::bo geometry_bo(device, batch.geometry.size() * sizeof(uint64_t),
-		kernel.group_id(4));
+		kernel.group_id(2));
 	xrt::bo logical_bo(device, batch.logical_row.size() * sizeof(id_t),
-		kernel.group_id(5));
+		kernel.group_id(3));
+	const auto embedded_commands = real_build_embedded_shard_commands(batch);
 	std::vector<xrt::bo> B_bo;
 	B_bo.reserve(kShards);
-	for (unsigned shard = 0; shard < kShards; ++shard)
-		B_bo.emplace_back(device, batch.B->at(shard).size() * sizeof(Beat512),
-			kernel.group_id(6 + shard));
+	for (unsigned shard = 0; shard < kShards; ++shard) {
+		const uint64_t words = batch.B->at(shard).size()
+			+ embedded_commands[shard].size();
+		if (words * sizeof(Beat512) > kRealTargetBankBytes)
+			throw std::runtime_error(
+				"B data plus embedded shard commands exceeds one HBM bank");
+		B_bo.emplace_back(device, words * sizeof(Beat512),
+			kernel.group_id(4 + shard));
+	}
 	std::array<xrt::bo, 4> output_bo = {
+		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(25)),
+		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(26)),
 		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(27)),
-		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(28)),
-		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(29)),
-		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(30))};
+		xrt::bo(device, uint64_t(data_capacity) * sizeof(Beat512), kernel.group_id(28))};
 	xrt::bo metadata_bo(device, uint64_t(meta_capacity) * sizeof(Beat512),
-		kernel.group_id(31));
+		kernel.group_id(29));
 	xrt::bo completion_bo(device,
-		uint64_t(completion_capacity) * sizeof(uint64_t), kernel.group_id(32));
+		uint64_t(completion_capacity) * sizeof(uint64_t), kernel.group_id(30));
 	std::array<xrt::bo, 4> port_stats_bo = {
+		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(31)),
+		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(32)),
 		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(33)),
-		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(34)),
-		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(35)),
-		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(36))};
-	xrt::bo meta_stats_bo(device, 4 * sizeof(id_t), kernel.group_id(37));
-	xrt::bo completion_stats_bo(device, 2 * sizeof(id_t), kernel.group_id(38));
-	xrt::bo scheduler_stats_bo(device, 16 * sizeof(id_t), kernel.group_id(39));
-	xrt::bo dense_stats_bo(device, 12 * sizeof(id_t), kernel.group_id(40));
-	xrt::bo heavy_stats_bo(device, 8 * sizeof(id_t), kernel.group_id(41));
+		xrt::bo(device, 4 * sizeof(id_t), kernel.group_id(34))};
+	xrt::bo meta_stats_bo(device, 4 * sizeof(id_t), kernel.group_id(35));
+	xrt::bo completion_stats_bo(device, 2 * sizeof(id_t), kernel.group_id(36));
+	xrt::bo scheduler_stats_bo(device, 16 * sizeof(id_t), kernel.group_id(37));
+	xrt::bo dense_stats_bo(device, 12 * sizeof(id_t), kernel.group_id(38));
+	xrt::bo heavy_stats_bo(device, 8 * sizeof(id_t), kernel.group_id(39));
+	std::cout << "[HOST] batch=" << batch_index << " bo_allocate complete"
+		<< std::endl;
 
-	std::memcpy(task_bo.map<void*>(), batch.tasks.data(),
-		batch.tasks.size() * sizeof(TaskWord512));
-	std::memcpy(rowptr_bo.map<void*>(), batch.row_task_ptr.data(),
-		batch.row_task_ptr.size() * sizeof(id_t));
 	std::memcpy(mask_bo.map<void*>(), batch.source_mask.data(),
 		batch.source_mask.size() * sizeof(uint32_t));
 	std::memcpy(geometry_bo.map<void*>(), batch.geometry.data(),
 		batch.geometry.size() * sizeof(uint64_t));
 	std::memcpy(logical_bo.map<void*>(), batch.logical_row.data(),
 		batch.logical_row.size() * sizeof(id_t));
-	for (unsigned shard = 0; shard < kShards; ++shard)
-		std::memcpy(B_bo[shard].map<void*>(), batch.B->at(shard).data(),
+	for (unsigned shard = 0; shard < kShards; ++shard) {
+		Beat512* destination = B_bo[shard].map<Beat512*>();
+		std::memcpy(destination, batch.B->at(shard).data(),
 			batch.B->at(shard).size() * sizeof(Beat512));
+		std::memcpy(destination + batch.B->at(shard).size(),
+			embedded_commands[shard].data(),
+			embedded_commands[shard].size() * sizeof(Beat512));
+	}
 	const auto static_h2d_begin = Clock::now();
-	task_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-	rowptr_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 	mask_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 	geometry_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 	logical_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 	for (xrt::bo& bo : B_bo) bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 	const double static_h2d_ms = std::chrono::duration<double, std::milli>(
 		Clock::now() - static_h2d_begin).count();
+	std::cout << "[HOST] batch=" << batch_index << " static_h2d complete ms="
+		<< static_h2d_ms << std::endl;
 
 	for (RealModeTotal& total : *totals) {
 		uint64_t merge_rows = 0, dense_rows = 0;
@@ -512,8 +824,10 @@ static void real_execute_batch(const Csr& matrix,
 		route_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 		const double route_h2d_ms = std::chrono::duration<double, std::milli>(
 			Clock::now() - route_h2d_begin).count();
+		std::cout << "[HOST] batch=" << batch_index << " mode=" << total.name
+			<< " route_h2d complete ms=" << route_h2d_ms << std::endl;
 		const auto launch = [&]() {
-			return kernel(task_bo, rowptr_bo, route_bo, mask_bo, geometry_bo,
+			return kernel(route_bo, mask_bo, geometry_bo,
 				logical_bo, B_bo[0], B_bo[1], B_bo[2], B_bo[3], B_bo[4],
 				B_bo[5], B_bo[6], B_bo[7],
 				static_cast<id_t>(batch.B->at(0).size()),
@@ -531,8 +845,12 @@ static void real_execute_batch(const Csr& matrix,
 				meta_stats_bo, completion_stats_bo, scheduler_stats_bo,
 				dense_stats_bo, heavy_stats_bo);
 		};
+		std::cout << "[HOST] batch=" << batch_index << " mode=" << total.name
+			<< " warmup launch" << std::endl;
 		auto warmup = launch();
 		warmup.wait();
+		std::cout << "[HOST] batch=" << batch_index << " mode=" << total.name
+			<< " warmup complete" << std::endl;
 		std::vector<double> batch_samples(reps);
 		for (unsigned rep = 0; rep < reps; ++rep) {
 			const auto begin = Clock::now();
@@ -568,7 +886,9 @@ static void real_execute_batch(const Csr& matrix,
 			completion_stats.size() * sizeof(id_t));
 		std::memcpy(scheduler_stats.data(), scheduler_stats_bo.map<void*>(),
 			scheduler_stats.size() * sizeof(id_t));
-		if (meta_stats[3] != 0 || completion_stats[1] != 0
+		if (meta_stats[3] != 0
+				|| (completion_stats[1] != 0
+					&& completion_stats[1] != kCompletionTraceDisabled)
 				|| meta_stats[0] > meta_capacity
 				|| completion_stats[0] > completion_capacity
 				|| scheduler_stats[0] != fragments
@@ -577,7 +897,8 @@ static void real_execute_batch(const Csr& matrix,
 		if (meta_stats[0] != 0)
 			metadata_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE,
 				uint64_t(meta_stats[0]) * sizeof(Beat512), 0);
-		if (completion_stats[0] != 0)
+		if (completion_stats[1] != kCompletionTraceDisabled
+				&& completion_stats[0] != 0)
 			completion_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE,
 				uint64_t(completion_stats[0]) * sizeof(uint64_t), 0);
 		const double d2h_ms = std::chrono::duration<double, std::milli>(
@@ -695,12 +1016,50 @@ int main(int argc, char** argv) {
 			dim_validate_rpc1_batch(matrix, packed);
 			RealFragmentBatch expanded = real_expand_rpc1(&packed);
 			for (RealFragmentBatch& batch : real_capacity_slices(expanded)) {
+				// Execute an exact half-open physical-fragment range when isolating
+				// whether a failure follows one row's data or accumulated protocol
+				// state.  This is a diagnostic-only Host slice; the packed fragment
+				// ABI presented to the FPGA remains unchanged.
+				if (const char* range_text
+						= std::getenv("ADAPT_DEBUG_FRAGMENT_RANGE")) {
+					const std::string range(range_text);
+					const size_t separator = range.find(':');
+					if (separator == std::string::npos)
+						throw std::runtime_error(
+							"ADAPT_DEBUG_FRAGMENT_RANGE must be begin:end");
+					const unsigned long begin = std::stoul(range.substr(0, separator));
+					const unsigned long end = std::stoul(range.substr(separator + 1));
+					if (begin >= end || end > batch.logical_row.size())
+						throw std::runtime_error(
+							"ADAPT_DEBUG_FRAGMENT_RANGE is outside the batch");
+					batch = real_slice(batch, begin, end);
+					std::cout << "[HOST] debug fragment range=" << begin
+						<< ':' << end << std::endl;
+				}
+				// Hardware bisection aid: execute a prefix of one already-valid
+				// physical-fragment batch, preserving the exact task/geometry ABI.
+				// It is ignored unless explicitly set and can never affect the
+				// production campaign or its frozen result CSVs.
+				if (const char* limit_text = std::getenv("ADAPT_DEBUG_MAX_FRAGMENTS")) {
+					const unsigned long requested = std::stoul(limit_text);
+					if (requested == 0)
+						throw std::runtime_error("ADAPT_DEBUG_MAX_FRAGMENTS must be positive");
+					if (requested < batch.logical_row.size()) {
+						batch = real_slice(batch, 0, requested);
+						std::cout << "[HOST] debug fragment prefix=" << requested
+							<< std::endl;
+					}
+				}
+				real_debug_round_robin_tasks(&batch);
+				real_debug_limit_tasks_per_shard(&batch);
+				real_debug_dump_fragment_tail(batch);
 				if (dry_run) {
 					std::cout << "real_batch=" << batch_index
 						<< " fragments=" << batch.logical_row.size()
 						<< " products=" << batch.products
 						<< " output_words_upper=" << batch.packet_words_upper
 						<< " PACKED\n";
+					real_print_dry_run_diagnostics(batch, batch_index);
 				} else {
 					real_execute_batch(matrix, batch, *device, *kernel, reps,
 						batch_index, heavy_threshold, csv, &totals);

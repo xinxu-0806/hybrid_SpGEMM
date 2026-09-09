@@ -15,49 +15,52 @@
 
 namespace {
 
-using UnifiedRealReaderCommand = TapaReaderCommand;
 using UnifiedRealProductPacket = TapaProductPacket;
 using UnifiedRealRawPacket = TapaBReaderRawPacket;
 
-static UnifiedRealReaderCommand unified_real_make_reader_command(
-		ap_uint<128> descriptor, id_t row, bool dense, id_t dense_base,
-		id_t span, bool heavy) {
-#pragma HLS INLINE
-	UnifiedRealReaderCommand command = 0;
-	command.range(127, 0) = descriptor;
-	command.range(159, 128) = row;
-	command.range(161, 160) = dense
-		? (ap_uint<2>)ADAPT_FP32_DENSE : (ap_uint<2>)ADAPT_FP32_MERGE;
-	command.range(195, 164) = dense_base;
-	command.range(227, 196) = span;
-	command[228] = heavy;
-	return command;
-}
+// One token is broadcast once per physical output fragment to each reader.
+// The reader obtains its own shard-local descriptor count/list from the tail
+// of its B HBM bank, so a hot shard can never fill a central per-task command
+// FIFO before the other shards receive their row boundary.
+//   allocator dispatch[127:0], dense_base[159:128], span[191:160], done[192].
+using UnifiedRealReaderDispatch = ap_uint<193>;
 
-static void unified_real_write_reader_command(
-		const UnifiedRealReaderCommand& command, ap_uint<3> shard,
-		tapa::ostream<UnifiedRealReaderCommand>& command0,
-		tapa::ostream<UnifiedRealReaderCommand>& command1,
-		tapa::ostream<UnifiedRealReaderCommand>& command2,
-		tapa::ostream<UnifiedRealReaderCommand>& command3,
-		tapa::ostream<UnifiedRealReaderCommand>& command4,
-		tapa::ostream<UnifiedRealReaderCommand>& command5,
-		tapa::ostream<UnifiedRealReaderCommand>& command6,
-		tapa::ostream<UnifiedRealReaderCommand>& command7) {
-#pragma HLS INLINE
-	switch ((unsigned)shard) {
-	case 0: command0.write(command); break;
-	case 1: command1.write(command); break;
-	case 2: command2.write(command); break;
-	case 3: command3.write(command); break;
-	case 4: command4.write(command); break;
-	case 5: command5.write(command); break;
-	case 6: command6.write(command); break;
-	default: command7.write(command); break;
+}  // namespace
+
+// The per-fragment completion array is a host-side diagnostic trace.  It is
+// redundant with the EOR metadata that already drives numerical validation.
+// Do not put that HBM write on the allocator's resource-release path: a
+// delayed diagnostic write can otherwise stop EOR delivery and form a cyclic
+// backpressure loop through the scheduler.  The packetizer emits a completion
+// only after it has emitted the final packet for the row, so forwarding it to
+// the scheduler alone is sufficient to safely retire the context.
+void unified_real_completion_to_scheduler(
+		tapa::istream<CompletionToken>& input,
+		tapa::ostream<MergeAllocator8EorToken>& allocator_output) {
+	bool done = false;
+	while (!done) {
+#pragma HLS PIPELINE II=1
+		const CompletionToken token = input.read();
+		MergeAllocator8EorToken eor = 0;
+		if (token[64]) eor[64] = 1;
+		else eor.range(42, 0) = token.range(42, 0);
+		allocator_output.write(eor);
+		done = token[64];
 	}
 }
 
-}  // namespace
+// Keep the existing kernel ABI and its completion-stat argument, while making
+// the trace state explicit to the Host.  2 means "trace intentionally
+// disabled" (0 is success with a materialized trace; 1 is overflow/error).
+void unified_real_completion_trace_disabled(id_t capacity,
+		tapa::mmap<ap_uint<64> > completion, tapa::mmap<id_t> stats) {
+	// Preserve the deployed AXI ABI without creating a per-row HBM write
+	// stream.  This independent, single diagnostic store is deliberately not
+	// connected to the allocator feedback path.
+	if (capacity != 0) completion[0] = 0;
+	stats[0] = 0;
+	stats[1] = 2;
+}
 
 // Translate the deployed route/profile arrays into the allocator's compact
 // command ABI.  EMPTY rows use a phantom source-zero boundary so they still
@@ -97,14 +100,13 @@ void unified_real_command_read(
 	output.write(terminal);
 }
 
-// One accepted allocation launches all B-row reads for that output row, then
-// broadcasts a row boundary.  The allocator may accept later rows before this
-// row completes, but there is still only one kernel invocation and no Host
-// round trip between rows.
+// One accepted allocation broadcasts only row metadata.  Each physical HBM
+// reader owns a shard-local command list appended to its B buffer and emits
+// its own row boundary after consuming that list.  This removes the cyclic
+// head-of-line dependency in which a central issuer could block on the 11th
+// command of one shard before sending boundaries to the other seven shards.
 void unified_real_dispatch_issue(
 		tapa::istream<MergeAllocator8DispatchToken>& dispatch_input,
-		tapa::mmap<const ap_uint<512> > task_words,
-		tapa::mmap<const id_t> row_task_ptr,
 		tapa::mmap<const ap_uint<64> > row_geometry,
 		tapa::ostream<UnifiedSourceDispatchToken>& source_dispatch0,
 		tapa::ostream<UnifiedSourceDispatchToken>& source_dispatch1,
@@ -114,14 +116,14 @@ void unified_real_dispatch_issue(
 		tapa::ostream<UnifiedSourceDispatchToken>& source_dispatch5,
 		tapa::ostream<UnifiedSourceDispatchToken>& source_dispatch6,
 		tapa::ostream<UnifiedSourceDispatchToken>& source_dispatch7,
-		tapa::ostream<UnifiedRealReaderCommand>& command0,
-		tapa::ostream<UnifiedRealReaderCommand>& command1,
-		tapa::ostream<UnifiedRealReaderCommand>& command2,
-		tapa::ostream<UnifiedRealReaderCommand>& command3,
-		tapa::ostream<UnifiedRealReaderCommand>& command4,
-		tapa::ostream<UnifiedRealReaderCommand>& command5,
-		tapa::ostream<UnifiedRealReaderCommand>& command6,
-		tapa::ostream<UnifiedRealReaderCommand>& command7,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch0,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch1,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch2,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch3,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch4,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch5,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch6,
+		tapa::ostream<UnifiedRealReaderDispatch>& reader_dispatch7,
 		tapa::ostream<BaseToken>& base0, tapa::ostream<BaseToken>& base1,
 		tapa::ostream<BaseToken>& base2, tapa::ostream<BaseToken>& base3,
 		tapa::ostream<BaseToken>& base4, tapa::ostream<BaseToken>& base5,
@@ -148,12 +150,16 @@ void unified_real_dispatch_issue(
 			source_dispatch5.write(source_terminal);
 			source_dispatch6.write(source_terminal);
 			source_dispatch7.write(source_terminal);
-			UnifiedRealReaderCommand reader_terminal = 0;
-			reader_terminal[163] = 1;
-			command0.write(reader_terminal); command1.write(reader_terminal);
-			command2.write(reader_terminal); command3.write(reader_terminal);
-			command4.write(reader_terminal); command5.write(reader_terminal);
-			command6.write(reader_terminal); command7.write(reader_terminal);
+			UnifiedRealReaderDispatch reader_terminal = 0;
+			reader_terminal[192] = 1;
+			reader_dispatch0.write(reader_terminal);
+			reader_dispatch1.write(reader_terminal);
+			reader_dispatch2.write(reader_terminal);
+			reader_dispatch3.write(reader_terminal);
+			reader_dispatch4.write(reader_terminal);
+			reader_dispatch5.write(reader_terminal);
+			reader_dispatch6.write(reader_terminal);
+			reader_dispatch7.write(reader_terminal);
 			const BaseToken base_terminal = end_base();
 			base0.write(base_terminal); base1.write(base_terminal);
 			base2.write(base_terminal); base3.write(base_terminal);
@@ -210,35 +216,166 @@ void unified_real_dispatch_issue(
 		source_dispatch4.write(source_token); source_dispatch5.write(source_token);
 		source_dispatch6.write(source_token); source_dispatch7.write(source_token);
 
-		const id_t task_begin = row_task_ptr[fragment];
-		const id_t task_end = row_task_ptr[fragment + 1];
-		ap_uint<512> cached_word = 0;
-		id_t cached_index = ~id_t(0);
-		for (id_t task = task_begin; task < task_end; ++task) {
-#pragma HLS PIPELINE II=1
-			const id_t word_index = task >> 2;
-			if (word_index != cached_index) {
-				cached_word = task_words[word_index];
-				cached_index = word_index;
-			}
-			const ap_uint<2> lane = task & 3;
-			const ap_uint<128> descriptor = cached_word.range(
-				(unsigned)lane * 128 + 127, (unsigned)lane * 128);
-			const UnifiedRealReaderCommand command
-				= unified_real_make_reader_command(
-					descriptor, row, dense, dense_base, span, heavy);
-			unified_real_write_reader_command(command,
-				descriptor.range(58, 56), command0, command1, command2, command3,
-				command4, command5, command6, command7);
-		}
-		UnifiedRealReaderCommand boundary = unified_real_make_reader_command(
-			0, row, dense, dense_base, span, heavy);
-		boundary[162] = 1;
-		command0.write(boundary); command1.write(boundary);
-		command2.write(boundary); command3.write(boundary);
-		command4.write(boundary); command5.write(boundary);
-		command6.write(boundary); command7.write(boundary);
+		UnifiedRealReaderDispatch reader_dispatch = 0;
+		reader_dispatch.range(127, 0) = dispatch;
+		reader_dispatch.range(159, 128) = dense_base;
+		reader_dispatch.range(191, 160) = span;
+		reader_dispatch0.write(reader_dispatch);
+		reader_dispatch1.write(reader_dispatch);
+		reader_dispatch2.write(reader_dispatch);
+		reader_dispatch3.write(reader_dispatch);
+		reader_dispatch4.write(reader_dispatch);
+		reader_dispatch5.write(reader_dispatch);
+		reader_dispatch6.write(reader_dispatch);
+		reader_dispatch7.write(reader_dispatch);
 		++sequence;
+	}
+}
+
+// B bank layout for every shard:
+//   [0, B_data_beats)                         packed B numerical data
+//   [B_data_beats, +ceil(fragment_count/16))  32-bit task count per fragment
+//   [after headers, ...]                      four 128-bit descriptors/beat
+// Descriptor records are concatenated in physical-fragment order.  Because
+// the scheduler preserves command order, every reader needs only a local
+// sequential descriptor cursor; no per-row start table or deep on-chip queue
+// is required.  The count header is cached for sixteen consecutive fragments.
+void unified_real_b_reader_fetch_embedded(
+		tapa::mmap<const ap_uint<512> > B, id_t B_data_beats,
+		id_t fragment_count,
+		tapa::istream<UnifiedRealReaderDispatch>& dispatches,
+		tapa::ostream<UnifiedRealRawPacket>& raw_packets) {
+	ap_uint<512> dense_cache_data[kTapaDenseBReaderCacheBeats];
+	id_t dense_cache_offset[kTapaDenseBReaderCacheRows];
+	ap_uint<4> dense_cache_beats[kTapaDenseBReaderCacheRows];
+	bool dense_cache_valid[kTapaDenseBReaderCacheRows];
+#pragma HLS BIND_STORAGE variable=dense_cache_data type=ram_t2p impl=bram latency=2
+#pragma HLS ARRAY_PARTITION variable=dense_cache_offset complete dim=1
+#pragma HLS ARRAY_PARTITION variable=dense_cache_beats complete dim=1
+#pragma HLS ARRAY_PARTITION variable=dense_cache_valid complete dim=1
+	for (int entry = 0; entry < kTapaDenseBReaderCacheRows; ++entry) {
+#pragma HLS UNROLL
+		dense_cache_offset[entry] = 0;
+		dense_cache_beats[entry] = 0;
+		dense_cache_valid[entry] = false;
+	}
+	ap_uint<4> dense_cache_replacement = 0;
+	const id_t header_words = (fragment_count + 15) >> 4;
+	id_t descriptor_cursor = 0;
+	id_t cached_header_index = ~id_t(0);
+	ap_uint<512> cached_header = 0;
+	id_t cached_descriptor_index = ~id_t(0);
+	ap_uint<512> cached_descriptors = 0;
+	bool done = false;
+	while (!done) {
+		const UnifiedRealReaderDispatch reader_dispatch = dispatches.read();
+		if (reader_dispatch[192]) {
+			UnifiedRealRawPacket terminal = 0;
+			terminal[552] = 1;
+			raw_packets.write(terminal);
+			done = true;
+			continue;
+		}
+
+		const ap_uint<128> dispatch = reader_dispatch.range(127, 0);
+		const id_t row = dispatch.range(31, 0);
+		const id_t fragment = dispatch.range(63, 32);
+		const bool dense = dispatch[121];
+		const bool heavy = dispatch[123];
+		const ap_uint<2> mode = dense
+			? (ap_uint<2>)ADAPT_FP32_DENSE
+			: (ap_uint<2>)ADAPT_FP32_MERGE;
+		const id_t dense_base = reader_dispatch.range(159, 128);
+		const id_t span = reader_dispatch.range(191, 160);
+		const id_t header_index = fragment >> 4;
+		if (header_index != cached_header_index) {
+			cached_header = B[B_data_beats + header_index];
+			cached_header_index = header_index;
+		}
+		const ap_uint<4> header_lane = fragment & 15;
+		const id_t command_count = cached_header.range(
+			(unsigned)header_lane * 32 + 31, (unsigned)header_lane * 32);
+
+		for (id_t local_command = 0; local_command < command_count;
+				++local_command) {
+			const id_t descriptor_index = descriptor_cursor >> 2;
+			if (descriptor_index != cached_descriptor_index) {
+				cached_descriptors = B[B_data_beats + header_words
+					+ descriptor_index];
+				cached_descriptor_index = descriptor_index;
+			}
+			const ap_uint<2> descriptor_lane = descriptor_cursor & 3;
+			const ap_uint<128> descriptor = cached_descriptors.range(
+				(unsigned)descriptor_lane * 128 + 127,
+				(unsigned)descriptor_lane * 128);
+			++descriptor_cursor;
+
+			const id_t offset = descriptor.range(31, 0);
+			const id_t length = descriptor.range(55, 32);
+			const id_t beats = (length + 7) >> 3;
+			const bool cacheable = dense && beats != 0
+				&& beats <= kTapaDenseBReaderCacheRowBeats;
+			bool cache_hit = false;
+			ap_uint<4> cache_hit_row = 0;
+			for (int entry = 0; entry < kTapaDenseBReaderCacheRows; ++entry) {
+#pragma HLS UNROLL
+				if (cacheable && dense_cache_valid[entry]
+						&& dense_cache_offset[entry] == offset
+						&& dense_cache_beats[entry] == beats) {
+					cache_hit = true;
+					cache_hit_row = entry;
+				}
+			}
+			const ap_uint<4> cache_fill_row = dense_cache_replacement;
+#pragma HLS DEPENDENCE variable=dense_cache_data inter false
+			for (id_t beat = 0; beat < beats; ++beat) {
+#pragma HLS PIPELINE II=1
+				const id_t address = offset + beat;
+				ap_uint<512> source = 0;
+				if (address < B_data_beats) {
+					if (cache_hit) {
+						const id_t cache_index
+							= ((id_t)cache_hit_row << 3) + beat;
+						source = dense_cache_data[cache_index];
+					} else {
+						source = B[address];
+						if (cacheable) {
+							const id_t cache_index
+								= ((id_t)cache_fill_row << 3) + beat;
+							dense_cache_data[cache_index] = source;
+						}
+					}
+				}
+				const id_t remaining = length - (beat << 3);
+				const ap_uint<4> valid = remaining > 8 ? 8 : remaining;
+				UnifiedRealRawPacket packet = 0;
+				packet.range(511, 0) = source;
+				packet.range(515, 512) = valid;
+				packet.range(547, 516) = row;
+				packet.range(549, 548) = mode;
+				packet[550] = beat + 1 == beats
+					|| (mode == ADAPT_FP32_MERGE
+						&& (beat + 1) % kTapaMergeRunPackets == 0);
+				packet.range(584, 553) = descriptor.range(127, 96);
+				packet.range(616, 585) = dense_base;
+				packet.range(648, 617) = span;
+				packet[649] = heavy;
+				raw_packets.write(packet);
+			}
+			if (cacheable && !cache_hit) {
+				dense_cache_offset[cache_fill_row] = offset;
+				dense_cache_beats[cache_fill_row] = beats;
+				dense_cache_valid[cache_fill_row] = true;
+				dense_cache_replacement = dense_cache_replacement + 1;
+			}
+		}
+
+		UnifiedRealRawPacket boundary = 0;
+		boundary.range(547, 516) = row;
+		boundary.range(549, 548) = mode;
+		boundary[551] = 1;
+		boundary[649] = heavy;
+		raw_packets.write(boundary);
 	}
 }
 
@@ -366,8 +503,6 @@ void unified_real_postlocal_adapter(
 }
 
 void adaptive_hbm_unified_real_hbm_tapa(
-		tapa::mmap<const ap_uint<512> > task_words,
-		tapa::mmap<const id_t> row_task_ptr,
 		tapa::mmap<const ap_uint<32> > route,
 		tapa::mmap<const ap_uint<32> > row_source_mask,
 		tapa::mmap<const ap_uint<64> > row_geometry,
@@ -409,13 +544,18 @@ void adaptive_hbm_unified_real_hbm_tapa(
 	// the previous physical congestion.
 	tapa::stream<MergeAllocator8CommandToken, 4> command_stream("command_stream");
 	tapa::stream<MergeAllocator8DispatchToken, 4> dispatch_stream("dispatch_stream");
-	tapa::stream<MergeAllocator8EorToken, 4> scheduler_eors("scheduler_eors");
-	tapa::stream<MergeAllocator8AckToken, 4> scheduler_acks("scheduler_acks");
-	tapa::stream<CompletionToken, 4> memory_completions("memory_completions");
+	// Completion returns form the only cyclic backpressure path: a long output
+	// burst must be able to retire completed rows while packet/meta writers are
+	// temporarily serving HBM.  Four entries pass short CSim gates but deadlock
+	// the routed design on sustained ex9 output.  Eight breaks that physical
+	// feedback cycle without replicating any reducer or changing arithmetic.
+	tapa::stream<MergeAllocator8EorToken, 8> scheduler_eors("scheduler_eors");
+	tapa::stream<MergeAllocator8AckToken, 8> scheduler_acks("scheduler_acks");
 	tapa::stream<ap_uint<512>, 2> scheduler_statistics("scheduler_statistics");
 
 	tapa::streams<UnifiedSourceDispatchToken, 8, 4> source_dispatches("source_dispatches");
-	tapa::streams<UnifiedRealReaderCommand, 8, 4> reader_commands("reader_commands");
+	tapa::streams<UnifiedRealReaderDispatch, 8, 4>
+		reader_dispatches("reader_dispatches");
 	tapa::streams<UnifiedRealRawPacket, 8, 8>
 		raw_packets("raw_packets");
 	tapa::streams<UnifiedRealProductPacket, 8, 8> products("products");
@@ -477,16 +617,16 @@ void adaptive_hbm_unified_real_hbm_tapa(
 	tapa::stream<CompletionToken, 4> heavy_completion("heavy_completion");
 	tapa::stream<PacketBundle, 2> empty_packet("empty_packet");
 	tapa::stream<CompletionToken, 2> empty_completion("empty_completion");
-	tapa::streams<PacketBundle, 4, 4> merge_port_packets("merge_port_packets");
-	tapa::streams<CompletionToken, 4, 4> merge_port_completions("merge_port_completions");
-	tapa::streams<PacketBundle, 3, 4> adaptive_port_packets("adaptive_port_packets");
-	tapa::streams<CompletionToken, 3, 4> adaptive_port_completions("adaptive_port_completions");
-	tapa::stream<CompletionToken, 4> raw_merged_completions("raw_merged_completions");
-	tapa::stream<CompletionToken, 4> merged_completions("merged_completions");
-	tapa::streams<RecordToken, 4, 4> records("records");
-	tapa::stream<RecordBatch, 4> record_batches("record_batches");
-	tapa::stream<WordToken, 4> meta_words("meta_words");
-	tapa::stream<StatsToken, 2> meta_summary("meta_summary");
+	tapa::streams<PacketBundle, 4, 8> merge_port_packets("merge_port_packets");
+	tapa::streams<CompletionToken, 4, 8> merge_port_completions("merge_port_completions");
+	tapa::streams<PacketBundle, 3, 8> adaptive_port_packets("adaptive_port_packets");
+	tapa::streams<CompletionToken, 3, 8> adaptive_port_completions("adaptive_port_completions");
+	tapa::stream<CompletionToken, 8> raw_merged_completions("raw_merged_completions");
+	tapa::stream<CompletionToken, 8> merged_completions("merged_completions");
+	tapa::streams<RecordToken, 4, 8> records("records");
+	tapa::stream<RecordBatch, 8> record_batches("record_batches");
+	tapa::stream<WordToken, 8> meta_words("meta_words");
+	tapa::stream<StatsToken, 4> meta_summary("meta_summary");
 
 	tapa::task()
 		.invoke(unified_real_command_read, route, row_source_mask, row_geometry,
@@ -495,22 +635,21 @@ void adaptive_hbm_unified_real_hbm_tapa(
 			heavy_merge_product_threshold, dispatch_stream, scheduler_acks,
 			scheduler_statistics)
 		.invoke(unified_allocator_ack_drain, scheduler_acks)
-		.invoke(unified_real_dispatch_issue, dispatch_stream, task_words,
-			row_task_ptr, row_geometry,
+		.invoke(unified_real_dispatch_issue, dispatch_stream, row_geometry,
 			source_dispatches[0], source_dispatches[1], source_dispatches[2],
 			source_dispatches[3], source_dispatches[4], source_dispatches[5],
 			source_dispatches[6], source_dispatches[7],
-			reader_commands[0], reader_commands[1], reader_commands[2],
-			reader_commands[3], reader_commands[4], reader_commands[5],
-			reader_commands[6], reader_commands[7],
+			reader_dispatches[0], reader_dispatches[1], reader_dispatches[2],
+			reader_dispatches[3], reader_dispatches[4], reader_dispatches[5],
+			reader_dispatches[6], reader_dispatches[7],
 			merge_bases[0], merge_bases[1], merge_bases[2], merge_bases[3],
 			merge_bases[4], merge_bases[5], merge_bases[6], merge_bases[7],
 			merge_bases[8], merge_bases[9], merge_bases[10], merge_bases[11],
 			merge_bases[12], merge_bases[13], merge_bases[14],
 			dense_bases[0], dense_bases[1], heavy_base)
 #define UNIFIED_REAL_FRONTEND(S, MEMORY, BEATS) \
-		.invoke(tapa_b_reader_fetch, MEMORY, BEATS, \
-			reader_commands[S], raw_packets[S]) \
+		.invoke(unified_real_b_reader_fetch_embedded, MEMORY, BEATS, \
+			fragment_count, reader_dispatches[S], raw_packets[S]) \
 		.invoke(tapa_b_reader_scale, raw_packets[S], \
 			products[S]) \
 		.invoke(tapa_shard_local_merge, products[S], \
@@ -697,8 +836,8 @@ void adaptive_hbm_unified_real_hbm_tapa(
 			merge_port_completions[3], raw_merged_completions)
 		.invoke(unified_full_wide_completion_coalesce,
 			raw_merged_completions, merged_completions)
-		.invoke(unified_allocator_completion_broadcast, merged_completions,
-			scheduler_eors, memory_completions)
+		.invoke(unified_real_completion_to_scheduler, merged_completions,
+			scheduler_eors)
 		.invoke(merge15_port_write, adaptive_port_packets[0],
 			output_data_word_capacity_per_port, output_item0,
 			output_port_stats0, records[0])
@@ -716,9 +855,8 @@ void adaptive_hbm_unified_real_hbm_tapa(
 		.invoke(merge15_meta_pack, record_batches, meta_words)
 		.invoke(merge15_meta_write, meta_words, meta_summary,
 			output_meta_word_capacity, output_meta, output_meta_stats)
-		.invoke(merge15_completion_write, memory_completions,
-			output_completion_capacity, output_completion,
-			output_completion_stats)
+		.invoke(unified_real_completion_trace_disabled,
+			output_completion_capacity, output_completion, output_completion_stats)
 		.invoke(unified_full_scheduler_statistics_write, scheduler_statistics,
 			scheduler_stats)
 		.invoke(unified_full_dense_statistics_write, dense_statistics[0],

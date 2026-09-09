@@ -1,5 +1,18 @@
 #include "adaptive_hbm_merge15_packetmeta4_tapa.h"
 
+// CSim-only hook: real HBM can temporarily deassert write acceptance, whereas
+// the default TAPA mmap model completes every store immediately.  The unified
+// long-stream regression enables this delay to exercise bounded packet/meta
+// FIFOs under downstream backpressure.  It is preprocessor-excluded from HLS.
+#ifndef __SYNTHESIS__
+#include <chrono>
+#include <thread>
+static unsigned g_merge15_csim_writer_delay_us = 0;
+void merge15_csim_set_writer_delay_us(unsigned delay_us) {
+	g_merge15_csim_writer_delay_us = delay_us;
+}
+#endif
+
 namespace {
 
 using MergeToken = ap_uint<129>;
@@ -386,6 +399,11 @@ void merge15_port_write(tapa::istream<PacketBundle>& input, id_t capacity,
 	bool done = false;
 	while (!done) {
 #pragma HLS PIPELINE II=1
+#ifndef __SYNTHESIS__
+		if (g_merge15_csim_writer_delay_us != 0)
+			std::this_thread::sleep_for(std::chrono::microseconds(
+				g_merge15_csim_writer_delay_us));
+#endif
 		const PacketBundle bundle = input.read();
 		if (bundle[640]) {
 			RecordToken end = 0;

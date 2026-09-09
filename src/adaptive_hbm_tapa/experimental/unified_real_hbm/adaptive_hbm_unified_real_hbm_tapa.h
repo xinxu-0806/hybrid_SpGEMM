@@ -9,16 +9,15 @@
 using id_t = std::uint32_t;
 
 // Production integration checkpoint.  Unlike the accepted synthetic-source
-// gate, this top consumes the real Host task table and eight packed B shards.
+// gate, this top consumes eight packed B shards whose tails hold independent
+// shard-local task lists.
 // Each command is one <=64K column fragment.  row_logical[fragment] preserves
 // the complete matrix row identity while row_source_mask/row_geometry and
-// row_task_ptr are indexed by the physical fragment.  A Host selector runs
-// once on the complete row and copies that route to every fragment.  The FPGA
+// route/profile arrays are indexed by the physical fragment.  A Host selector
+// runs once on the complete row and copies that route to every fragment.  The FPGA
 // consumes all fragments in one invocation and the tagged four-port output
 // lets the Host reunite disjoint fragments without numerical re-reduction.
 void adaptive_hbm_unified_real_hbm_tapa(
-		tapa::mmap<const ap_uint<512> > task_words,
-		tapa::mmap<const id_t> row_task_ptr,
 		tapa::mmap<const ap_uint<32> > route,
 		tapa::mmap<const ap_uint<32> > row_source_mask,
 		tapa::mmap<const ap_uint<64> > row_geometry,

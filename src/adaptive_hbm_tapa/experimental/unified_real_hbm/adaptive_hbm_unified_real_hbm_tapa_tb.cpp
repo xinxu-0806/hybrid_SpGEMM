@@ -3,12 +3,15 @@
 #include "../unified_adaptive_full_output/adaptive_hbm_unified_adaptive_full_output_tapa.h"
 
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <set>
 #include <utility>
 #include <vector>
+
+void merge15_csim_set_writer_delay_us(unsigned delay_us);
 
 namespace {
 
@@ -146,14 +149,89 @@ int main(int argc, char** argv) {
 	expected[{0, 70001}] = 7.0f;
 	expected_nnz[0] = 4;
 
-	std::vector<ap_uint<512> > task_words((tasks.size() + 3) / 4);
-	for (unsigned index = 0; index < tasks.size(); ++index)
-		task_words[index >> 2].range((index & 3) * 128 + 127,
-			(index & 3) * 128) = tasks[index];
+	// Exact regression for the routed-board deadlock: one shard owns far more
+	// than the old four-entry central command FIFO could absorb before the row
+	// boundaries were broadcast.  Independent embedded command readers must
+	// complete this row without relying on an artificially deep on-chip FIFO.
+	{
+		const uint32_t row = logical_rows.size();
+		const uint32_t base = 80000;
+		for (unsigned command = 0; command < 64; ++command) {
+			add_b_task(1, {{base + command, 1.0f}}, 1.0f);
+			expected[{row, base + command}] = 1.0f;
+		}
+		for (unsigned shard = 0; shard < 8; ++shard) {
+			if (shard == 1) continue;
+			add_b_task(shard, {{base + 64 + shard, 1.0f}}, 1.0f);
+			expected[{row, base + 64 + shard}] = 1.0f;
+		}
+		add_profile(ADAPT_FP32_DENSE, 71, 0xff, base, 128);
+		expected_nnz[row] = 71;
+		expected_route[row] = UNIFIED_FULL_OUTPUT_DENSE;
+	}
+
+	// Sustained real-matrix scheduler regression: the original integration
+	// proof had only six physical fragments, while ex9 presents thousands.
+	// Feed 4096 consecutive, all-eight-shard DENSE rows so both accumulator
+	// contexts are repeatedly allocated and retired behind realistic reader
+	// boundaries.  Each row uses distinct keys, which makes output accounting
+	// exact without hiding a missing completion behind a duplicate reduction.
+	for (uint32_t stress = 0; stress < 4096; ++stress) {
+		const uint32_t row = logical_rows.size();
+		const uint32_t base = 100000 + stress * 64;
+		for (unsigned shard = 0; shard < 8; ++shard) {
+			add_b_task(shard, {{base + shard, 1.0f}}, 1.0f);
+			expected[{row, base + shard}] = 1.0f;
+		}
+		add_profile(ADAPT_FP32_DENSE, 8, 0xff, base, 64);
+		expected_nnz[row] = 8;
+		expected_route[row] = UNIFIED_FULL_OUTPUT_DENSE;
+	}
+
 	for (unsigned shard = 0; shard < 8; ++shard)
 		if (B[shard].empty()) B[shard].resize(1);
 
-	constexpr id_t kCapacity = 1024;
+	// Append the same per-shard command-tail ABI used by the production Host.
+	const std::array<id_t, 8> B_data_beats = {
+		(id_t)B[0].size(), (id_t)B[1].size(), (id_t)B[2].size(),
+		(id_t)B[3].size(), (id_t)B[4].size(), (id_t)B[5].size(),
+		(id_t)B[6].size(), (id_t)B[7].size()};
+	const size_t header_words = (routes.size() + 15) / 16;
+	std::array<std::vector<ap_uint<512> >, 8> command_tail;
+	std::array<uint64_t, 8> command_counts{};
+	for (unsigned shard = 0; shard < 8; ++shard)
+		command_tail[shard].resize(header_words);
+	for (size_t fragment = 0; fragment < routes.size(); ++fragment) {
+		std::array<uint32_t, 8> counts{};
+		for (id_t task = row_ptr[fragment]; task < row_ptr[fragment + 1]; ++task)
+			++counts[(unsigned)tasks[task].range(58, 56)];
+		for (unsigned shard = 0; shard < 8; ++shard) {
+			const unsigned slot = fragment & 15U;
+			command_tail[shard][fragment >> 4].range(
+				slot * 32 + 31, slot * 32) = counts[shard];
+			command_counts[shard] += counts[shard];
+		}
+	}
+	for (unsigned shard = 0; shard < 8; ++shard)
+		command_tail[shard].resize(header_words
+			+ (command_counts[shard] + 3) / 4);
+	std::array<uint64_t, 8> command_cursor{};
+	for (size_t fragment = 0; fragment < routes.size(); ++fragment) {
+		for (id_t task = row_ptr[fragment]; task < row_ptr[fragment + 1]; ++task) {
+			const unsigned shard = (unsigned)tasks[task].range(58, 56);
+			const uint64_t cursor = command_cursor[shard]++;
+			command_tail[shard][header_words + (cursor >> 2)].range(
+				(cursor & 3U) * 128 + 127, (cursor & 3U) * 128) = tasks[task];
+		}
+	}
+	for (unsigned shard = 0; shard < 8; ++shard)
+		B[shard].insert(B[shard].end(), command_tail[shard].begin(),
+			command_tail[shard].end());
+
+	// 4096 stress rows can concentrate their packet output in one physical
+	// port, so size all diagnostic memories above that worst case.  This is a
+	// CSim-only buffer bound, not an accelerator capacity change.
+	constexpr id_t kCapacity = 8192;
 	std::vector<ap_uint<512> > output[4];
 	std::vector<id_t> port_stats[4];
 	for (unsigned port = 0; port < 4; ++port) {
@@ -165,9 +243,10 @@ int main(int argc, char** argv) {
 	std::vector<id_t> meta_stats(4), completion_stats(2), scheduler_stats(16);
 	std::vector<id_t> dense_stats(12), heavy_stats(8);
 
+	// Force bounded packet/meta FIFOs to absorb realistic downstream write
+	// pauses.  This hook exists only in the CSim build of the writer.
+	merge15_csim_set_writer_delay_us(5);
 	tapa::invoke(adaptive_hbm_unified_real_hbm_tapa, bitstream,
-		tapa::read_only_mmap<const ap_uint<512> >(task_words),
-		tapa::read_only_mmap<const id_t>(row_ptr),
 		tapa::read_only_mmap<const ap_uint<32> >(routes),
 		tapa::read_only_mmap<const ap_uint<32> >(masks),
 		tapa::read_only_mmap<const ap_uint<64> >(geometry),
@@ -180,9 +259,9 @@ int main(int argc, char** argv) {
 		tapa::read_only_mmap<const ap_uint<512> >(B[5]),
 		tapa::read_only_mmap<const ap_uint<512> >(B[6]),
 		tapa::read_only_mmap<const ap_uint<512> >(B[7]),
-		(id_t)B[0].size(), (id_t)B[1].size(), (id_t)B[2].size(),
-		(id_t)B[3].size(), (id_t)B[4].size(), (id_t)B[5].size(),
-		(id_t)B[6].size(), (id_t)B[7].size(),
+		B_data_beats[0], B_data_beats[1], B_data_beats[2],
+		B_data_beats[3], B_data_beats[4], B_data_beats[5],
+		B_data_beats[6], B_data_beats[7],
 		(id_t)routes.size(), (id_t)12, kCapacity, kCapacity, kCapacity,
 		tapa::write_only_mmap<ap_uint<512> >(output[0]),
 		tapa::write_only_mmap<ap_uint<512> >(output[1]),
@@ -199,6 +278,7 @@ int main(int argc, char** argv) {
 		tapa::write_only_mmap<id_t>(scheduler_stats),
 		tapa::write_only_mmap<id_t>(dense_stats),
 		tapa::write_only_mmap<id_t>(heavy_stats));
+	merge15_csim_set_writer_delay_us(0);
 
 	unsigned total_items = 0, total_eors = 0;
 	for (unsigned port = 0; port < 4; ++port) {
@@ -208,7 +288,7 @@ int main(int argc, char** argv) {
 	}
 	const unsigned expected_eors = routes.size() + expected_wide_rows.size();
 	if (total_items != expected.size() || total_eors != expected_eors
-			|| completion_stats[0] != routes.size()) {
+			|| completion_stats[0] != 0 || completion_stats[1] != 2) {
 		std::printf("UNIFIED_REAL_HBM_CSIM: FAIL totals items=%u/%zu eors=%u/%u completions=%u\n",
 			total_items, expected.size(), total_eors, expected_eors,
 			(unsigned)completion_stats[0]);
@@ -259,22 +339,16 @@ int main(int argc, char** argv) {
 				+ (expected_wide_rows.count(row.first) ? 1u : 0u)
 				|| eor_nnz[row.first] != row.second) return 7;
 	}
-	std::map<uint32_t, unsigned> completion_count;
-	for (unsigned index = 0; index < completion_stats[0]; ++index) {
-		const ap_uint<64> event = completions[index];
-		if (event[49]) return 8;
-		++completion_count[(uint32_t)event.range(42, 11)];
-	}
-	for (const auto& row : expected_nnz)
-		if (completion_count[row.first] != (row.first == 0 ? 2u : 1u))
-			return 8;
+	const unsigned expected_dense_fragments = 3 + 4096;
+	const unsigned expected_dense_physical_units = 4 + 4096;
 	if (scheduler_stats[0] != routes.size()
 			|| scheduler_stats[1] != routes.size()
-			|| scheduler_stats[3] != 2 || heavy_stats[2] != 1
-			|| dense_stats[0] + dense_stats[6] != 3
+			|| scheduler_stats[3] != expected_dense_fragments
+			|| heavy_stats[2] != 1
+			|| dense_stats[0] + dense_stats[6] != expected_dense_physical_units
 			|| dense_stats[5] != 0 || dense_stats[11] != 0) return 8;
 
-	std::printf("UNIFIED_REAL_HBM_CSIM: PASS fragments=%zu logical_rows=%zu ordinary_merge=2 heavy_merge=1 dense=2 wide_dense=1 empty=1 cross_64k_row=1 items=%zu real_fetch=8 real_scale=8 real_shard_local_merge=8 postlocal_adapter=8 four_hbm=1\n",
+	std::printf("UNIFIED_REAL_HBM_CSIM: PASS fragments=%zu logical_rows=%zu ordinary_merge=2 heavy_merge=1 dense=3 wide_dense=1 empty=1 cross_64k_row=1 imbalanced_shard_commands=64 items=%zu real_fetch=8 real_scale=8 real_shard_local_merge=8 postlocal_adapter=8 four_hbm=1\n",
 		routes.size(), expected_nnz.size(), expected.size());
 	return 0;
 }
